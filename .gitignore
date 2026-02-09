@@ -1,0 +1,28 @@
+# Archivos de configuración con credenciales
+emby.conf
+
+# Logs y archivos temporales
+*.log
+*.txt
+*.tmp
+
+# Archivos descargados
+*.mkv
+*.mp4
+*.avi
+*.mp3
+*.wmv
+
+# IDEs y editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code settings locales
+.claude/settings.local.json
+
+# Archivos de sistemas
+.DS_Store
+Thumbs.db

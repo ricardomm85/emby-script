@@ -1,0 +1,9 @@
+# Configuración del servidor Emby
+EMBY_HOST="tu-servidor-emby.com"
+EMBY_PORT="8096"
+EMBY_EMAIL="tu-email@ejemplo.com"
+EMBY_PASSWORD="tu-contraseña"
+
+# Token de acceso (se generará automáticamente al autenticarse)
+EMBY_TOKEN=""
+EMBY_USER_ID=""
