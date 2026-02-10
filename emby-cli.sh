@@ -131,8 +131,11 @@ api_request() {
     local endpoint="$1"
     local extra_args="${2:-}"
 
+    local separator="?"
+    [[ "$endpoint" == *\?* ]] && separator="&"
+
     curl -s --max-time "$TIMEOUT" \
-        "${BASE_URL}${endpoint}&api_key=${EMBY_TOKEN}${extra_args}" \
+        "${BASE_URL}${endpoint}${separator}api_key=${EMBY_TOKEN}${extra_args}" \
         -H "X-Emby-Token: ${EMBY_TOKEN}" 2>/dev/null
 }
 
