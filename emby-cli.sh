@@ -644,7 +644,7 @@ cmd_episode_job() {
         esac
     done
 
-    local response ep_data ep_id ep_name series_name container filename full_path temp_path download_url
+    local response ep_data ep_id ep_name series_name container filename full_path temp_path download_url total_size ep_info
     response=$(api_request "/Shows/${series_id}/Episodes?UserId=${EMBY_USER_ID}")
     ep_data=$(echo "$response" | jq -r --argjson ep "$episode_num" --argjson ssn "$season" '.Items[] | select(.IndexNumber == $ep and (.ParentIndexNumber // 1) == $ssn) | {id: .Id, name: .Name, series: .SeriesName, container: (.Container // "mkv")}')
 
@@ -654,6 +654,8 @@ cmd_episode_job() {
     ep_name=$(echo "$ep_data" | jq -r '.name')
     series_name=$(echo "$ep_data" | jq -r '.series')
     container=$(echo "$ep_data" | jq -r '.container')
+    ep_info=$(api_request "/Users/${EMBY_USER_ID}/Items/${ep_id}")
+    total_size=$(echo "$ep_info" | jq -r '.Size // 0')
 
     mkdir -p "$dest"
     filename=$(printf "S%02dE%02d_%s.%s" "$season" "$episode_num" "$(echo "$ep_name" | sed 's/[^a-zA-Z0-9._-]/_/g')" "$container")
@@ -670,7 +672,7 @@ cmd_episode_job() {
     pid=$!
 
     cat > "$job_file" <<EOF
-{"job_id":"$job_id","pid":$pid,"item_id":"$ep_id","name":"$(json_escape "$series_name - S${season}E${episode_num} - $ep_name")","type":"Episode","total_size":0,"temp_path":"$(json_escape "$temp_path")","final_path":"$(json_escape "$full_path")","status":"downloading"}
+{"job_id":"$job_id","pid":$pid,"item_id":"$ep_id","name":"$(json_escape "$series_name - S${season}E${episode_num} - $ep_name")","type":"Episode","total_size":$total_size,"temp_path":"$(json_escape "$temp_path")","final_path":"$(json_escape "$full_path")","status":"downloading"}
 EOF
 
     if [ "$OUTPUT_FORMAT" = "json" ]; then
@@ -708,10 +710,27 @@ cmd_job_status() {
         downloaded=$(file_size_bytes "$final_path")
     else
         downloaded=$(file_size_bytes "$temp_path")
+
         if [ "$alive" = true ]; then
             status="downloading"
         else
-            status="failed"
+            # Proceso terminó: si el temporal está completo (o no tenemos total pero hay datos), finalizar
+            if [ "$downloaded" -gt 0 ] 2>/dev/null; then
+                if [ "$total_size" -gt 0 ] 2>/dev/null; then
+                    if [ "$downloaded" -ge "$total_size" ] 2>/dev/null; then
+                        mv "$temp_path" "$final_path" 2>/dev/null || true
+                    fi
+                else
+                    mv "$temp_path" "$final_path" 2>/dev/null || true
+                fi
+            fi
+
+            if [ -f "$final_path" ] && [ -s "$final_path" ]; then
+                status="completed"
+                downloaded=$(file_size_bytes "$final_path")
+            else
+                status="failed"
+            fi
         fi
     fi
 
