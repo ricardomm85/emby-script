@@ -13,6 +13,7 @@ CONFIG_FILE="$(dirname "$0")/emby.conf"
 OUTPUT_FORMAT="text"  # text | json | compact
 TIMEOUT=30
 CONNECT_TIMEOUT=10
+JOBS_DIR="$(dirname "$0")/.emby-jobs"
 
 # Colores (solo para modo text)
 RED='\033[0;31m'
@@ -69,6 +70,36 @@ output() {
             fi
             ;;
     esac
+}
+
+ensure_jobs_dir() {
+    mkdir -p "$JOBS_DIR"
+}
+
+file_size_bytes() {
+    local path="$1"
+    [ -f "$path" ] && stat -c%s "$path" 2>/dev/null || echo 0
+}
+
+resolve_best_match() {
+    local query="$1"
+    local item_type="${2:-}"
+    local encoded_query
+    encoded_query=$(echo "$query" | sed 's/ /%20/g')
+
+    local endpoint="/Users/${EMBY_USER_ID}/Items?Recursive=true&searchTerm=${encoded_query}&Limit=20&Fields=MediaSources"
+    [ -n "$item_type" ] && endpoint="${endpoint}&IncludeItemTypes=${item_type}"
+
+    local response
+    response=$(api_request "$endpoint")
+
+    echo "$response" | jq -c --arg q "$query" '
+      .Items // [] |
+      map(select(.Type=="Movie" or .Type=="Series")) |
+      ( map(select((.Name|ascii_downcase) == ($q|ascii_downcase))) + . ) |
+      unique_by(.Id) |
+      .[0] // {}
+    ' 2>/dev/null
 }
 
 # Cargar configuración
@@ -155,8 +186,12 @@ COMANDOS:
     search <término>       Buscar películas o series
     list <tipo>            Listar contenido (movies|series)
     info <id>              Información detallada de un item
-    download <id>          Descargar item (película o serie)
-    episode <id> <ep>      Descargar episodio específico
+    download <id>          Descargar película (foreground)
+    episode <id> <ep>      Descargar episodio específico (foreground)
+    resolve <texto>        Resolver nombre -> item (Movie/Series)
+    download-job <id>      Iniciar descarga en background (película)
+    episode-job <id> <ep>  Iniciar descarga episodio en background
+    job-status <job_id>    Ver progreso de descarga en background
     seasons <id>           Listar temporadas de una serie
     help                   Mostrar esta ayuda
 
@@ -512,6 +547,199 @@ cmd_episode() {
     fi
 }
 
+# COMANDO: resolve
+cmd_resolve() {
+    local query="$1"
+    shift || true
+
+    local item_type=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --type|-t) item_type="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local best
+    best=$(resolve_best_match "$query" "$item_type")
+
+    if [ -z "$best" ] || [ "$best" = "{}" ]; then
+        [ "$OUTPUT_FORMAT" = "json" ] && echo "{}" || output "warning" "Sin resultados para: $query"
+        return 1
+    fi
+
+    if [ "$OUTPUT_FORMAT" = "json" ]; then
+        echo "$best" | jq -c '{id: .Id, name: .Name, type: .Type, year: .ProductionYear}'
+    else
+        echo "$best" | jq -r '"\(.Type) | \(.Id) | \(.Name) (\(.ProductionYear // "N/A"))"'
+    fi
+}
+
+# COMANDO: download-job
+cmd_download_job() {
+    local item_id="$1"
+    shift
+    local dest="."
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dest|-d) dest="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    ensure_jobs_dir
+
+    local info name type container clean_name filename full_path temp_path total_size download_url
+    info=$(api_request "/Users/${EMBY_USER_ID}/Items/${item_id}")
+    name=$(echo "$info" | jq -r '.Name // empty')
+    type=$(echo "$info" | jq -r '.Type // empty')
+    container=$(echo "$info" | jq -r '.Container // "mkv"')
+    total_size=$(echo "$info" | jq -r '.Size // 0')
+
+    if [ -z "$name" ]; then output "error" "Item no encontrado: $item_id"; exit 1; fi
+    if [ "$type" = "Series" ]; then output "error" "Usa episode-job para series"; exit 1; fi
+
+    mkdir -p "$dest"
+    clean_name=$(echo "$name" | sed 's/[^a-zA-Z0-9._-]/_/g')
+    filename="${clean_name}.${container}"
+    full_path="${dest}/${filename}"
+    temp_path="${full_path}.download"
+    download_url="${BASE_URL}/Videos/${item_id}/stream?static=true&api_key=${EMBY_TOKEN}"
+
+    local job_id job_file pid
+    job_id="job-$(date +%s)-$RANDOM"
+    job_file="${JOBS_DIR}/${job_id}.json"
+
+    nohup curl -L -C - -o "$temp_path" "$download_url" -H "X-Emby-Token: ${EMBY_TOKEN}" >/dev/null 2>&1 &
+    pid=$!
+
+    cat > "$job_file" <<EOF
+{"job_id":"$job_id","pid":$pid,"item_id":"$item_id","name":"$(json_escape "$name")","type":"$type","total_size":$total_size,"temp_path":"$(json_escape "$temp_path")","final_path":"$(json_escape "$full_path")","status":"downloading"}
+EOF
+
+    if [ "$OUTPUT_FORMAT" = "json" ]; then
+        cat "$job_file"
+    else
+        output "success" "Descarga iniciada: $name"
+        echo "job_id: $job_id"
+        echo "archivo: $full_path"
+    fi
+}
+
+# COMANDO: episode-job
+cmd_episode_job() {
+    local series_id="$1"
+    local episode_num="$2"
+    shift 2
+
+    local season=1
+    local dest="."
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --season|-s) season="$2"; shift 2 ;;
+            --dest|-d) dest="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local response ep_data ep_id ep_name series_name container filename full_path temp_path download_url
+    response=$(api_request "/Shows/${series_id}/Episodes?UserId=${EMBY_USER_ID}")
+    ep_data=$(echo "$response" | jq -r --argjson ep "$episode_num" --argjson ssn "$season" '.Items[] | select(.IndexNumber == $ep and (.ParentIndexNumber // 1) == $ssn) | {id: .Id, name: .Name, series: .SeriesName, container: (.Container // "mkv")}')
+
+    if [ -z "$ep_data" ]; then output "error" "Episodio S${season}E${episode_num} no encontrado"; exit 1; fi
+
+    ep_id=$(echo "$ep_data" | jq -r '.id')
+    ep_name=$(echo "$ep_data" | jq -r '.name')
+    series_name=$(echo "$ep_data" | jq -r '.series')
+    container=$(echo "$ep_data" | jq -r '.container')
+
+    mkdir -p "$dest"
+    filename=$(printf "S%02dE%02d_%s.%s" "$season" "$episode_num" "$(echo "$ep_name" | sed 's/[^a-zA-Z0-9._-]/_/g')" "$container")
+    full_path="${dest}/${filename}"
+    temp_path="${full_path}.download"
+    download_url="${BASE_URL}/Videos/${ep_id}/stream?static=true&api_key=${EMBY_TOKEN}"
+
+    ensure_jobs_dir
+    local job_id job_file pid
+    job_id="job-$(date +%s)-$RANDOM"
+    job_file="${JOBS_DIR}/${job_id}.json"
+
+    nohup curl -L -C - -o "$temp_path" "$download_url" -H "X-Emby-Token: ${EMBY_TOKEN}" >/dev/null 2>&1 &
+    pid=$!
+
+    cat > "$job_file" <<EOF
+{"job_id":"$job_id","pid":$pid,"item_id":"$ep_id","name":"$(json_escape "$series_name - S${season}E${episode_num} - $ep_name")","type":"Episode","total_size":0,"temp_path":"$(json_escape "$temp_path")","final_path":"$(json_escape "$full_path")","status":"downloading"}
+EOF
+
+    if [ "$OUTPUT_FORMAT" = "json" ]; then
+        cat "$job_file"
+    else
+        output "success" "Descarga iniciada: ${series_name} S${season}E${episode_num}"
+        echo "job_id: $job_id"
+        echo "archivo: $full_path"
+    fi
+}
+
+# COMANDO: job-status
+cmd_job_status() {
+    local job_id="$1"
+    ensure_jobs_dir
+    local job_file="${JOBS_DIR}/${job_id}.json"
+
+    if [ ! -f "$job_file" ]; then
+        output "error" "Job no encontrado: $job_id"
+        exit 1
+    fi
+
+    local pid temp_path final_path total_size name alive downloaded percent status
+    pid=$(jq -r '.pid' "$job_file")
+    temp_path=$(jq -r '.temp_path' "$job_file")
+    final_path=$(jq -r '.final_path' "$job_file")
+    total_size=$(jq -r '.total_size // 0' "$job_file")
+    name=$(jq -r '.name' "$job_file")
+
+    alive=false
+    kill -0 "$pid" 2>/dev/null && alive=true
+
+    if [ -f "$final_path" ] && [ -s "$final_path" ]; then
+        status="completed"
+        downloaded=$(file_size_bytes "$final_path")
+    else
+        downloaded=$(file_size_bytes "$temp_path")
+        if [ "$alive" = true ]; then
+            status="downloading"
+        else
+            status="failed"
+        fi
+    fi
+
+    percent=0
+    if [ "$total_size" -gt 0 ] 2>/dev/null; then
+        percent=$(awk -v d="$downloaded" -v t="$total_size" 'BEGIN { if (t>0) printf "%.2f", (d/t)*100; else print 0 }')
+    fi
+
+    if [ "$OUTPUT_FORMAT" = "json" ]; then
+        jq -n \
+          --arg job_id "$job_id" \
+          --arg name "$name" \
+          --arg status "$status" \
+          --argjson pid "$pid" \
+          --argjson downloaded "$downloaded" \
+          --argjson total "$total_size" \
+          --arg percent "$percent" \
+          --arg final_path "$final_path" \
+          '{job_id:$job_id,name:$name,status:$status,pid:$pid,downloaded_bytes:$downloaded,total_bytes:$total,percent:$percent,final_path:$final_path}'
+    else
+        echo "Job: $job_id"
+        echo "Nombre: $name"
+        echo "Estado: $status"
+        echo "Progreso: ${percent}% (${downloaded}/${total_size} bytes)"
+        echo "Archivo: $final_path"
+    fi
+}
+
 #============================================
 # MAIN
 #============================================
@@ -552,7 +780,7 @@ main() {
             cmd_help
             exit 0
             ;;
-        search|list|info|seasons|download|episode)
+        search|list|info|seasons|download|episode|resolve|download-job|episode-job|job-status)
             load_config
             authenticate
             ;;
@@ -565,12 +793,16 @@ main() {
 
     # Ejecutar comando
     case "$command" in
-        search)   cmd_search "$@" ;;
-        list)     cmd_list "$@" ;;
-        info)     cmd_info "$@" ;;
-        seasons)  cmd_seasons "$@" ;;
-        download) cmd_download "$@" ;;
-        episode)  cmd_episode "$@" ;;
+        search)       cmd_search "$@" ;;
+        list)         cmd_list "$@" ;;
+        info)         cmd_info "$@" ;;
+        seasons)      cmd_seasons "$@" ;;
+        resolve)      cmd_resolve "$@" ;;
+        download)     cmd_download "$@" ;;
+        episode)      cmd_episode "$@" ;;
+        download-job) cmd_download_job "$@" ;;
+        episode-job)  cmd_episode_job "$@" ;;
+        job-status)   cmd_job_status "$@" ;;
     esac
 }
 
